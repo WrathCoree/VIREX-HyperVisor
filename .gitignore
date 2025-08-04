@@ -1,0 +1,23 @@
+# Microsoft Visual C++ generated files
+Debug/
+Release/
+x64/
+Win32/
+*.obj
+*.pdb
+*.ilk
+*.suo
+*.user
+*.exe
+*.sys
+*.lib
+*.sbr
+*.log
+
+# Build artifacts
+build/
+dist/
+
+# IDE files
+.vs/
+/.vscode/
