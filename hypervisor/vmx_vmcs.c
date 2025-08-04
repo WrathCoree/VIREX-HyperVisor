@@ -2,15 +2,35 @@
  * vmx_vmcs.c
  *
  *  Manages the setup and configuration of the Virtual Machine Control
- *  Structure (VMCS) for each virtualized processor.
+ *  Structure (VMCS) for each virtualized processor. This file contains
+ *  advanced implementations including MSR bitmaps and robust control
+ *  field configuration.
  */
 
 #include "include/vmx.h"
 #include "include/ept.h"
 #include "include/intercepts.h"
 
-// External reference to the main VM-Exit handler.
-VOID VhVmexitHandler(VOID);
+// External reference to the main VM-Exit handler assembly routine.
+extern VOID VhVmexitHandler(VOID);
+
+/*
+ * Adjusts a VMX control value based on the capability MSRs.
+ * This ensures that we only set bits that are supported by the processor,
+ * following the algorithm described in the Intel SDM.
+ */
+static UINT32 VhAdjustControlValue(VMX_MSR MSR, UINT32 DesiredValue)
+{
+    UINT64 capabilityMsr = __readmsr(MSR);
+    UINT32 allowed0_settings = (UINT32)(capabilityMsr & 0xFFFFFFFF);
+    UINT32 allowed1_settings = (UINT32)(capabilityMsr >> 32);
+
+    UINT32 finalValue = DesiredValue;
+    finalValue |= allowed0_settings; // Bits that must be 1.
+    finalValue &= allowed1_settings; // Bits that can be 1.
+
+    return finalValue;
+}
 
 /*
  * Allocates a 4KB VMCS region for a logical processor.
@@ -33,7 +53,7 @@ VOID VhAllocateVmcsRegion(PPER_CPU_VMX_DATA VmxData)
         RtlSecureZeroMemory(VmxData->VmcsRegion, VMCS_SIZE);
         
         // Write the VMCS revision ID from the MSR.
-        IA32_VMX_BASIC_MSR vmx_basic_msr = { __readmsr(MSR_IA32_VMX_BASIC) };
+        IA32_VMX_BASIC_MSR vmx_basic_msr = { .All = __readmsr(MSR_IA32_VMX_BASIC) };
         RtlCopyMemory(VmxData->VmcsRegion, &vmx_basic_msr.VmcsRevisionId, sizeof(UINT32));
 
         VmxData->VmcsRegionPa = MmGetPhysicalAddress(VmxData->VmcsRegion);
@@ -66,9 +86,8 @@ VOID VhFillGuestSelectorData(
     
     VmxSelector->AccessRights.All = ((descriptor->High.Bits.Present & 1) << 7) |
                                     ((descriptor->High.Bits.Dpl & 3) << 5) |
-                                    ((descriptor->High.Bits.Type & 1) << 4) |
-                                    (descriptor->High.Bits.Type & 0xF) |
-                                    ((descriptor->High.Bits.System & 1) << 4);
+                                    ((descriptor->High.Bits.System & 1) << 4) |
+                                    (descriptor->High.Bits.Type & 0xF);
 
     if (!VmxSelector->AccessRights.Bits.Present)
     {
@@ -94,6 +113,8 @@ VOID VhSetupVmcs(PPER_CPU_VMX_DATA VmxData)
     KDESCRIPTOR gdt_desc = { 0 };
     KDESCRIPTOR idt_desc = { 0 };
     VMX_SEGMENT_SELECTOR vmx_seg = { 0 };
+    
+    UINT32 pin_based_ctls, proc_based_ctls, proc_based_ctls2, exit_ctls, entry_ctls;
 
     __sgdt(&gdt_desc);
     __sidt(&idt_desc);
@@ -149,8 +170,11 @@ VOID VhSetupVmcs(PPER_CPU_VMX_DATA VmxData)
     __vmx_vmwrite(GUEST_GS_LIMIT, vmx_seg.Limit);
     __vmx_vmwrite(GUEST_GS_AR_BYTES, vmx_seg.AccessRights.All);
 
-    __vmx_vmwrite(GUEST_LDTR_SELECTOR, 0);
-    __vmx_vmwrite(GUEST_LDTR_AR_BYTES, 0x10000); // Unusable
+    __vmx_vmwrite(GUEST_LDTR_SELECTOR, GetLdtr());
+    VhFillGuestSelectorData((PVOID)gdt_desc.Base, GetLdtr(), &vmx_seg);
+    __vmx_vmwrite(GUEST_LDTR_BASE, vmx_seg.Base);
+    __vmx_vmwrite(GUEST_LDTR_LIMIT, vmx_seg.Limit);
+    __vmx_vmwrite(GUEST_LDTR_AR_BYTES, vmx_seg.AccessRights.All);
 
     __vmx_vmwrite(GUEST_TR_SELECTOR, GetTr());
     VhFillGuestSelectorData((PVOID)gdt_desc.Base, GetTr(), &vmx_seg);
@@ -159,13 +183,14 @@ VOID VhSetupVmcs(PPER_CPU_VMX_DATA VmxData)
     __vmx_vmwrite(GUEST_TR_AR_BYTES, vmx_seg.AccessRights.All);
 
     __vmx_vmwrite(GUEST_RFLAGS, __readeflags());
+    __vmx_vmwrite(VMCS_LINK_POINTER, ~0ULL);
 
     // Host state setup
     __vmx_vmwrite(HOST_CR0, __readcr0());
     __vmx_vmwrite(HOST_CR3, __readcr3());
     __vmx_vmwrite(HOST_CR4, __readcr4());
     __vmx_vmwrite(HOST_RIP, (size_t)VhVmexitHandler);
-    __vmx_vmwrite(HOST_RSP, (size_t)VmxData->VmxonRegion + VMXON_SIZE);
+    __vmx_vmwrite(HOST_RSP, (size_t)VmxData->HostStack + HOST_STACK_SIZE);
 
     __vmx_vmwrite(HOST_ES_SELECTOR, GetEs() & ~RPL_MASK);
     __vmx_vmwrite(HOST_CS_SELECTOR, GetCs() & ~RPL_MASK);
@@ -179,29 +204,33 @@ VOID VhSetupVmcs(PPER_CPU_VMX_DATA VmxData)
     __vmx_vmwrite(HOST_IDTR_BASE, idt_desc.Base);
     __vmx_vmwrite(HOST_FS_BASE, __readmsr(MSR_IA32_FS_BASE));
     __vmx_vmwrite(HOST_GS_BASE, __readmsr(MSR_IA32_GS_BASE));
+    __vmx_vmwrite(HOST_TR_BASE, vmx_seg.Base);
 
-    // VM-Execution control fields
-    IA32_VMX_PINBASED_CTLS_MSR pin_based_ctls = { __readmsr(MSR_IA32_VMX_PINBASED_CTLS) };
-    IA32_VMX_PROCBASED_CTLS_MSR proc_based_ctls = { __readmsr(MSR_IA32_VMX_PROCBASED_CTLS) };
-    IA32_VMX_PROCBASED_CTLS2_MSR proc_based_ctls2 = { __readmsr(MSR_IA32_VMX_PROCBASED_CTLS2) };
-    IA32_VMX_EXIT_CTLS_MSR exit_ctls = { __readmsr(MSR_IA32_VMX_EXIT_CTLS) };
-    IA32_VMX_ENTRY_CTLS_MSR entry_ctls = { __readmsr(MSR_IA32_VMX_ENTRY_CTLS) };
+    // Set desired VM-Execution control fields.
+    pin_based_ctls = VM_EXEC_CONTROLS_PIN_BASED_EXTERNAL_INTERRUPT_EXITING;
+    
+    proc_based_ctls = VM_EXEC_CONTROLS_PROC_BASED_USE_MSR_BITMAPS |
+                      VM_EXEC_CONTROLS_PROC_BASED_ACTIVATE_SECONDARY_CONTROLS;
 
-    pin_based_ctls.Allowed_0_Settings.ExternalInterruptExiting = 1;
-    proc_based_ctls.Allowed_0_Settings.UseMsrBitmaps = 1;
-    proc_based_ctls.Allowed_0_Settings.ActivateSecondaryControls = 1;
-    proc_based_ctls2.Allowed_0_Settings.EnableEpt = 1;
-    exit_ctls.Allowed_0_Settings.HostAddressSpaceSize = 1;
-    entry_ctls.Allowed_0_Settings.Ia32eModeGuest = 1;
+    proc_based_ctls2 = VM_EXEC_CONTROLS_PROC_BASED_2_ENABLE_EPT |
+                       VM_EXEC_CONTROLS_PROC_BASED_2_ENABLE_RDTSCP;
 
-    __vmx_vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin_based_ctls.Allowed_1_Settings.All);
-    __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, proc_based_ctls.Allowed_1_Settings.All);
-    __vmx_vmwrite(SECONDARY_VM_EXEC_CONTROL, proc_based_ctls2.Allowed_1_Settings.All);
-    __vmx_vmwrite(VM_EXIT_CONTROLS, exit_ctls.Allowed_1_Settings.All);
-    __vmx_vmwrite(VM_ENTRY_CONTROLS, entry_ctls.Allowed_1_Settings.All);
+    exit_ctls = VM_EXIT_CONTROLS_HOST_ADDRESS_SPACE_SIZE;
+    
+    entry_ctls = VM_ENTRY_CONTROLS_IA32E_MODE_GUEST;
 
-    // Set up MSR bitmap (currently allows all MSR access).
-    __vmx_vmwrite(MSR_BITMAP, 0);
+    // Adjust controls based on hardware capabilities for robustness.
+    __vmx_vmwrite(PIN_BASED_VM_EXEC_CONTROL, VhAdjustControlValue(MSR_IA32_VMX_PINBASED_CTLS, pin_based_ctls));
+    __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, VhAdjustControlValue(MSR_IA32_VMX_PROCBASED_CTLS, proc_based_ctls));
+    __vmx_vmwrite(SECONDARY_VM_EXEC_CONTROL, VhAdjustControlValue(MSR_IA32_VMX_PROCBASED_CTLS2, proc_based_ctls2));
+    __vmx_vmwrite(VM_EXIT_CONTROLS, VhAdjustControlValue(MSR_IA32_VMX_EXIT_CTLS, exit_ctls));
+    __vmx_vmwrite(VM_ENTRY_CONTROLS, VhAdjustControlValue(MSR_IA32_VMX_ENTRY_CTLS, entry_ctls));
+    
+    // Set up exception bitmap to trap on breakpoints.
+    __vmx_vmwrite(EXCEPTION_BITMAP, 1 << BP_EXCEPTION);
+
+    // Set up MSR bitmap to reduce VM-Exits.
+    __vmx_vmwrite(MSR_BITMAP, VmxData->MsrBitmapPa.QuadPart);
 
     // Enable EPT.
     VhEnableEpt(VmxData);
@@ -235,9 +264,9 @@ VOID VhLaunchVm(ULONG ProcessorIndex)
         return;
     }
 
-    // Configure all VMCS fields.
+    // Configure all VMCS fields with advanced settings.
     VhSetupVmcs(vmxData);
-    DbgPrint("VIREX-HV: [Core %d] VMCS configured.\n", ProcessorIndex);
+    DbgPrint("VIREX-HV: [Core %d] VMCS configured with MSR bitmap and advanced controls.\n", ProcessorIndex);
 
     // Launch the guest.
     __vmx_vmlaunch();

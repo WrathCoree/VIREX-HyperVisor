@@ -16,6 +16,8 @@
 #define VMXON_SIZE PAGE_SIZE
 #define VMCS_SIZE  PAGE_SIZE
 #define GUEST_STACK_SIZE (PAGE_SIZE * 8)
+#define HOST_STACK_SIZE (PAGE_SIZE * 8)
+#define MSR_BITMAP_SIZE PAGE_SIZE
 #define RPL_MASK 0x3
 
 // MSR addresses for VMX operations.
@@ -29,7 +31,8 @@ typedef enum _VMX_MSR
     MSR_IA32_VMX_PROCBASED_CTLS2 = 0x48B,
     MSR_IA32_FEATURE_CONTROL = 0x3A,
     MSR_IA32_FS_BASE = 0xC0000100,
-    MSR_IA32_GS_BASE = 0xC0000101
+    MSR_IA32_GS_BASE = 0xC0000101,
+    MSR_IA32_LSTAR = 0xC0000082
 } VMX_MSR;
 
 // Structure for CPUID EAX=1 result.
@@ -49,9 +52,9 @@ typedef union _CPUID_EAX_01
     } Fields;
     struct
     {
-        UINT32 Reserved1 : 21;
+        UINT32 Reserved1 : 5;
         UINT32 VirtualMachineExtensions : 1;
-        UINT32 Reserved2 : 10;
+        UINT32 Reserved2 : 26;
     };
 } CPUID_EAX_01, *PCPUID_EAX_01;
 
@@ -62,8 +65,17 @@ typedef union _IA32_FEATURE_CONTROL_MSR
     struct
     {
         UINT64 LockBit : 1;
-        UINT64 EnableVmxon : 1;
-        UINT64 Reserved : 62;
+        UINT64 EnableVmxonInsideSmx : 1;
+        UINT64 EnableVmxonOutsideSmx : 1;
+        UINT64 Reserved1 : 5;
+        UINT64 SenterLocalFunctionEnables : 7;
+        UINT64 SenterGlobalEnable : 1;
+        UINT64 Reserved2 : 1;
+        UINT64 SgxLaunchControlEnable : 1;
+        UINT64 SgxGlobalEnable : 1;
+        UINT64 Reserved3 : 1;
+        UINT64 LmaceOn : 1;
+        UINT64 Reserved4 : 43;
     };
 } IA32_FEATURE_CONTROL_MSR, *PIA32_FEATURE_CONTROL_MSR;
 
@@ -71,10 +83,13 @@ typedef union _IA32_FEATURE_CONTROL_MSR
 typedef struct _PER_CPU_VMX_DATA
 {
     PVOID       VmxonRegion;
-    PVOID       VmcsRegion;
     PHYSICAL_ADDRESS VmxonRegionPa;
+    PVOID       VmcsRegion;
     PHYSICAL_ADDRESS VmcsRegionPa;
+    PVOID       MsrBitmap;
+    PHYSICAL_ADDRESS MsrBitmapPa;
     PVOID       GuestStack;
+    PVOID       HostStack;
     BOOLEAN     IsVmxon;
     EPT_STATE   EptState;
 } PER_CPU_VMX_DATA, *PPER_CPU_VMX_DATA;

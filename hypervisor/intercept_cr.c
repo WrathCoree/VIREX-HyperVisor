@@ -1,10 +1,15 @@
 /*
  * intercept_cr.c
  *
- *  Handles VM-Exits caused by guest access to control registers (CRs).
+ *  Handles VM-Exits caused by guest access to control registers (CRs),
+ *  now with enhanced logging for process context switches.
  */
 
 #include "include/vmx.h"
+#include <ntddk.h>
+
+// Keep track of the last known CR3 to detect changes.
+static ULONG_PTR g_LastKnownCr3[256] = { 0 }; // Per-processor
 
 /*
  * Intercepts guest access to control registers.
@@ -13,7 +18,8 @@ VOID VhHandleCrAccess(PGUEST_REGS GuestRegs)
 {
     size_t qualification = 0;
     __vmx_vmread(VM_EXIT_QUALIFICATION, &qualification);
-
+    
+    ULONG processorIndex = KeGetCurrentProcessorNumberEx(NULL);
     ULONG cr_number = (ULONG)(qualification & 0xF);
     ULONG access_type = (ULONG)((qualification >> 4) & 3);
     ULONG reg_index = (ULONG)((qualification >> 8) & 0xF);
@@ -26,9 +32,20 @@ VOID VhHandleCrAccess(PGUEST_REGS GuestRegs)
         case 0: // MOV to CR
             if (cr_number == 3)
             {
-                // Guest is writing to CR3. Update the shadow and guest CR3.
+                // Guest is writing a new page table base into CR3.
+                // This indicates a process context switch.
+                if (g_LastKnownCr3[processorIndex] != *pReg)
+                {
+                    PEPROCESS currentProcess = PsGetCurrentProcess();
+                    HANDLE currentPid = PsGetProcessId(currentProcess);
+                    DbgPrint("VIREX-HV: [CR] Context switch on Core %d to PID: %llu, New CR3: 0x%llX\n",
+                        processorIndex,
+                        (UINT64)currentPid,
+                        *pReg);
+
+                    g_LastKnownCr3[processorIndex] = *pReg;
+                }
                 __vmx_vmwrite(GUEST_CR3, *pReg);
-                DbgPrint("VIREX-HV: [CR] CR3 write to 0x%llX by guest.\n", *pReg);
             }
             break;
         case 1: // MOV from CR

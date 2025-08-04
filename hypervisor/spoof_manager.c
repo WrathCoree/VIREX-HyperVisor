@@ -66,10 +66,44 @@ VOID VhCleanupSpoofManager()
  */
 NTSTATUS VhSetMsrSpoof(UINT32 MsrIndex, UINT64 SpoofedValue)
 {
-    // A full implementation would find an existing rule or create a new one.
-    UNREFERENCED_PARAMETER(MsrIndex);
-    UNREFERENCED_PARAMETER(SpoofedValue);
-    DbgPrint("VIREX-HV: [Spoof] Set MSR 0x%X to be spoofed.\n", MsrIndex);
+    KLOCK_QUEUE_HANDLE lockHandle;
+    PLIST_ENTRY entry;
+    BOOLEAN ruleExists = FALSE;
+
+    KeAcquireInStackQueuedSpinLock(&g_MsrSpoofLock, &lockHandle);
+    
+    // Check if a rule for this MSR already exists.
+    for (entry = g_MsrSpoofList.Flink; entry != &g_MsrSpoofList; entry = entry->Flink)
+    {
+        PMSR_SPOOF_RULE rule = CONTAINING_RECORD(entry, MSR_SPOOF_RULE, Link);
+        if (rule->MsrIndex == MsrIndex)
+        {
+            // Rule exists, just update the value.
+            rule->SpoofedValue = SpoofedValue;
+            ruleExists = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    // If no rule exists, create a new one.
+    if (!ruleExists)
+    {
+        PMSR_SPOOF_RULE new_rule = ExAllocatePoolWithTag(NonPagedPool, sizeof(MSR_SPOOF_RULE), 'msr');
+        if (!new_rule)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        new_rule->MsrIndex = MsrIndex;
+        new_rule->SpoofedValue = SpoofedValue;
+
+        KeAcquireInStackQueuedSpinLock(&g_MsrSpoofLock, &lockHandle);
+        InsertTailList(&g_MsrSpoofList, &new_rule->Link);
+        KeReleaseInStackQueuedSpinLock(&lockHandle);
+    }
+
+    DbgPrint("VIREX-HV: [Spoof] Set/updated MSR rule for 0x%X.\n", MsrIndex);
     return STATUS_SUCCESS;
 }
 
@@ -78,10 +112,24 @@ NTSTATUS VhSetMsrSpoof(UINT32 MsrIndex, UINT64 SpoofedValue)
  */
 BOOLEAN VhFindMsrSpoof(UINT32 MsrIndex, PUINT64 SpoofedValue)
 {
-    // A full implementation would search the g_MsrSpoofList.
-    UNREFERENCED_PARAMETER(MsrIndex);
-    UNREFERENCED_PARAMETER(SpoofedValue);
-    return FALSE;
+    KLOCK_QUEUE_HANDLE lockHandle;
+    PLIST_ENTRY entry;
+    BOOLEAN found = FALSE;
+
+    KeAcquireInStackQueuedSpinLock(&g_MsrSpoofLock, &lockHandle);
+    for (entry = g_MsrSpoofList.Flink; entry != &g_MsrSpoofList; entry = entry->Flink)
+    {
+        PMSR_SPOOF_RULE rule = CONTAINING_RECORD(entry, MSR_SPOOF_RULE, Link);
+        if (rule->MsrIndex == MsrIndex)
+        {
+            *SpoofedValue = rule->SpoofedValue;
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    
+    return found;
 }
 
 /*
@@ -89,10 +137,44 @@ BOOLEAN VhFindMsrSpoof(UINT32 MsrIndex, PUINT64 SpoofedValue)
  */
 NTSTATUS VhSetCpuidSpoofFull(UINT32 Leaf, UINT32 SubLeaf, PCPUID_SPOOF_VALUES Values)
 {
-    // A full implementation would find an existing rule or create a new one.
-    UNREFERENCED_PARAMETER(SubLeaf);
-    UNREFERENCED_PARAMETER(Values);
-    DbgPrint("VIREX-HV: [Spoof] Set CPUID Leaf 0x%X to be spoofed.\n", Leaf);
+    KLOCK_QUEUE_HANDLE lockHandle;
+    PLIST_ENTRY entry;
+    BOOLEAN ruleExists = FALSE;
+
+    KeAcquireInStackQueuedSpinLock(&g_CpuidSpoofLock, &lockHandle);
+
+    // Check if a rule for this CPUID leaf/subleaf already exists.
+    for (entry = g_CpuidSpoofList.Flink; entry != &g_CpuidSpoofList; entry = entry->Flink)
+    {
+        PCPUID_SPOOF_RULE rule = CONTAINING_RECORD(entry, CPUID_SPOOF_RULE, Link);
+        if (rule->Leaf == Leaf && rule->SubLeaf == SubLeaf)
+        {
+            rule->Values = *Values;
+            ruleExists = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    
+    // If no rule exists, create a new one.
+    if (!ruleExists)
+    {
+        PCPUID_SPOOF_RULE new_rule = ExAllocatePoolWithTag(NonPagedPool, sizeof(CPUID_SPOOF_RULE), 'cpu');
+        if (!new_rule)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        new_rule->Leaf = Leaf;
+        new_rule->SubLeaf = SubLeaf;
+        new_rule->Values = *Values;
+
+        KeAcquireInStackQueuedSpinLock(&g_CpuidSpoofLock, &lockHandle);
+        InsertTailList(&g_CpuidSpoofList, &new_rule->Link);
+        KeReleaseInStackQueuedSpinLock(&lockHandle);
+    }
+    
+    DbgPrint("VIREX-HV: [Spoof] Set/updated CPUID rule for Leaf 0x%X, Subleaf 0x%X.\n", Leaf, SubLeaf);
     return STATUS_SUCCESS;
 }
 

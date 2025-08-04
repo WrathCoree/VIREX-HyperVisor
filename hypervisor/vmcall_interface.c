@@ -62,6 +62,11 @@ VOID VhHandleVmcall(PGUEST_REGS GuestRegs)
             GuestRegs->rax = status;
             break;
         
+        case VMCALL_TRACE_SYSCALL:
+            status = VhTraceSyscall(eptState, (ULONG)param1);
+            GuestRegs->rax = status;
+            break;
+
         case VMCALL_SET_RDTSC_SPOOF:
             status = VhSetRdtscSpoof((UINT64)param1, (UINT64)param2);
             GuestRegs->rax = status;

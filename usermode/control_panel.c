@@ -2,7 +2,7 @@
  * control_panel.c
  *
  *  User-mode console application for interacting with and controlling
- *  the VIREX-HYPERVISOR kernel driver.
+ *  the VIREX-HYPERVISOR kernel driver. Now with a functional JSON loader.
  */
 
 #include <stdio.h>
@@ -46,12 +46,80 @@ void HandleRdtscSpoof(HANDLE hDevice)
     }
 }
 
+// Reads the entire content of a file into a buffer.
+char* ReadFileContent(const char* filename)
+{
+    FILE* f;
+    long length;
+    char* content;
+
+    if (fopen_s(&f, filename, "rb") != 0)
+    {
+        perror("Error opening file");
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    content = (char*)malloc(length + 1);
+    if (content)
+    {
+        fread(content, 1, length, f);
+        content[length] = '\0';
+    }
+    fclose(f);
+    return content;
+}
+
 // Function to load and process VMCALLs from a JSON file.
 void HandleJsonLoad(HANDLE hDevice)
 {
-    // A full implementation would prompt for a file name, read the file,
-    // parse it with cJSON, and issue the corresponding VMCALLs.
-    printf("[INFO] JSON loading is a conceptual feature.\n");
+    char filename[256];
+    printf("Enter JSON file path (e.g., C:\\config.json): ");
+    scanf_s("%255s", filename, (unsigned)_countof(filename));
+
+    char* json_string = ReadFileContent(filename);
+    if (!json_string)
+    {
+        return;
+    }
+
+    cJSON* root = cJSON_Parse(json_string);
+    if (!root)
+    {
+        printf("[ERROR] Failed to parse JSON: %s\n", cJSON_GetErrorPtr());
+        free(json_string);
+        return;
+    }
+    
+    cJSON* command_item = NULL;
+    cJSON_ArrayForEach(command_item, root)
+    {
+        cJSON* command = cJSON_GetObjectItemCaseSensitive(command_item, "command");
+        cJSON* params = cJSON_GetObjectItemCaseSensitive(command_item, "params");
+
+        if (cJSON_IsString(command) && (command->valuestring != NULL))
+        {
+            printf("Executing command: %s\n", command->valuestring);
+            
+            if (strcmp(command->valuestring, "set_rdtsc_spoof") == 0)
+            {
+                cJSON* multiplier = cJSON_GetObjectItemCaseSensitive(params, "multiplier");
+                cJSON* offset = cJSON_GetObjectItemCaseSensitive(params, "offset");
+                if (cJSON_IsNumber(multiplier) && cJSON_IsNumber(offset))
+                {
+                    VMCALL_CONTEXT_RDTSC context = { .Multiplier = (UINT64)multiplier->valuedouble, .Offset = (UINT64)offset->valuedouble };
+                    HvIssueVmcall(hDevice, VMCALL_SET_RDTSC_SPOOF, (UINT64)&context);
+                }
+            }
+            // Add other command handlers here (e.g., "set_msr_spoof")
+        }
+    }
+
+    cJSON_Delete(root);
+    free(json_string);
 }
 
 

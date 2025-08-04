@@ -36,10 +36,10 @@ BOOLEAN VhCheckVmxSupport()
     if (!feature_control_msr.LockBit)
     {
         // If Lock Bit is 0, we can attempt to enable VMX.
-        feature_control_msr.EnableVmxon = TRUE;
+        feature_control_msr.EnableVmxonOutsideSmx = TRUE;
         __writemsr(MSR_IA32_FEATURE_CONTROL, feature_control_msr.All);
     }
-    else if (!feature_control_msr.EnableVmxon)
+    else if (!feature_control_msr.EnableVmxonOutsideSmx)
     {
         DbgPrint("VIREX-HV: VMX disabled by BIOS.\n");
         return FALSE;
@@ -87,13 +87,15 @@ VOID VhVmxInitializationCallback(
 
     ULONG processorIndex = KeGetCurrentProcessorNumberEx(NULL);
     PHYSICAL_ADDRESS vmxonRegionPa;
+    PHYSICAL_ADDRESS maxAddr;
+    maxAddr.QuadPart = MAXULONG64;
 
     // Set the VMXE bit in CR4 to enable VMX.
     __writecr4(__readcr4() | CR4_VMX_ENABLE_BIT);
     DbgPrint("VIREX-HV: [Core %d] VMXE bit enabled in CR4.\n", processorIndex);
 
     // Get the VMX revision identifier and write it to the VMXON region.
-    IA32_VMX_BASIC_MSR vmx_basic_msr = { __readmsr(MSR_IA32_VMX_BASIC) };
+    IA32_VMX_BASIC_MSR vmx_basic_msr = { .All = __readmsr(MSR_IA32_VMX_BASIC) };
     RtlCopyMemory(g_VmxData[processorIndex].VmxonRegion, &vmx_basic_msr.VmcsRevisionId, sizeof(UINT32));
 
     // Execute VMXON instruction.
@@ -107,16 +109,27 @@ VOID VhVmxInitializationCallback(
     g_VmxData[processorIndex].IsVmxon = TRUE;
     DbgPrint("VIREX-HV: [Core %d] VMXON successful.\n", processorIndex);
 
-    // Allocate and set up the VMCS and Guest Stack for this processor.
+    // Allocate and set up the VMCS, Stacks, and MSR Bitmap for this processor.
     VhAllocateVmcsRegion(&g_VmxData[processorIndex]);
     g_VmxData[processorIndex].GuestStack = ExAllocatePoolWithTag(NonPagedPool, GUEST_STACK_SIZE, 'GS');
-    
-    if (!g_VmxData[processorIndex].GuestStack)
+    g_VmxData[processorIndex].HostStack = ExAllocatePoolWithTag(NonPagedPool, HOST_STACK_SIZE, 'HS');
+    g_VmxData[processorIndex].MsrBitmap = MmAllocateContiguousNodeMemory(MSR_BITMAP_SIZE, maxAddr, maxAddr, maxAddr, PAGE_READWRITE, MM_ANY_NODE_OK);
+
+    if (!g_VmxData[processorIndex].GuestStack || !g_VmxData[processorIndex].HostStack || !g_VmxData[processorIndex].MsrBitmap)
     {
-        DbgPrint("VIREX-HV: [Core %d] Failed to allocate guest stack.\n");
+        DbgPrint("VIREX-HV: [Core %d] Failed to allocate guest/host stack or MSR bitmap.\n", processorIndex);
+        if (g_VmxData[processorIndex].GuestStack) ExFreePoolWithTag(g_VmxData[processorIndex].GuestStack, 'GS');
+        if (g_VmxData[processorIndex].HostStack) ExFreePoolWithTag(g_VmxData[processorIndex].HostStack, 'HS');
+        if (g_VmxData[processorIndex].MsrBitmap) MmFreeContiguousMemory(g_VmxData[processorIndex].MsrBitmap);
         __vmx_off();
         return;
     }
+    g_VmxData[processorIndex].MsrBitmapPa = MmGetPhysicalAddress(g_VmxData[processorIndex].MsrBitmap);
+    RtlSecureZeroMemory(g_VmxData[processorIndex].MsrBitmap, MSR_BITMAP_SIZE);
+
+    // Trap on writes to IA32_LSTAR to monitor for syscall hook attempts.
+    PUCHAR msr_bitmap_rw = (PUCHAR)g_VmxData[processorIndex].MsrBitmap + 2048;
+    msr_bitmap_rw[(MSR_IA32_LSTAR - 0xC0000000) / 8] |= (1 << ((MSR_IA32_LSTAR - 0xC0000000) % 8));
 
     // Proceed to launch the VM on this processor.
     VhLaunchVm(processorIndex);
@@ -163,6 +176,7 @@ NTSTATUS HvInitializeVmx(PVOID DriverBase, ULONG DriverSize)
     // Initialize spoofing, cloaking and other subsystems.
     VhInitializeSpoofManager();
     VhInitializeInt3Cloaking();
+    VhInitializeSyscallTrace();
     
     // Execute VMX initialization on all cores via DPC.
     KeGenericCallDpc(VhVmxInitializationCallback, NULL);
@@ -200,12 +214,21 @@ VOID HvShutdownVmx()
         {
             ExFreePoolWithTag(g_VmxData[i].GuestStack, 'GS');
         }
+        if (g_VmxData[i].HostStack)
+        {
+            ExFreePoolWithTag(g_VmxData[i].HostStack, 'HS');
+        }
+        if (g_VmxData[i].MsrBitmap)
+        {
+            MmFreeContiguousMemory(g_VmxData[i].MsrBitmap);
+        }
         VhCleanupEpt(&g_VmxData[i].EptState);
     }
 
     // Cleanup global subsystems.
     VhCleanupSpoofManager();
     VhCleanupInt3Cloaking();
+    VhCleanupSyscallTrace();
 
     if (g_VmxData)
     {
